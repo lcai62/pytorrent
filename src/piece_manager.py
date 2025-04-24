@@ -2,7 +2,9 @@
 
 import hashlib
 import math
+import random
 import time
+from collections import Counter
 from typing import Optional, List
 
 from src.torrent_file import TorrentFile
@@ -30,6 +32,22 @@ class PieceManager:
             for i in range(len(self._hashes))
         ]
 
+        self.availability = Counter()
+
+    def add_have(self, index):
+        """
+        gets called for every "have"
+        """
+        self.availability[index] += 1
+
+    def add_bitmap(self, bitmap):
+        """
+        called for initial bitmap for each peer
+        """
+        for idx, have in enumerate(bitmap):
+            if have:
+                self.availability[idx] += 1
+
     def next_request(self, peer_bitmap) -> Optional["Block"]:
         """
         returns next block that this peer can serve
@@ -39,6 +57,35 @@ class PieceManager:
                 continue
             block = piece.next_block()
             if block is not None:
+                return block
+
+        return None
+
+    def next_request_rarest_first(self, peer_bitmap) -> Optional["Block"]:
+        choices = [
+            piece for piece in self.pieces
+            if (not piece.is_complete) and peer_bitmap[piece.index]
+        ]
+        if not choices:
+            return None
+
+        # find lowest avail
+        min_avail = min(self.availability.get(piece.index) for piece in choices)
+
+        rarest = [
+            piece for piece in choices if self.availability.get(piece.index, 0) == min_avail
+        ]
+
+        random.shuffle(rarest)
+        for piece in rarest:
+            block = piece.next_block()
+            if block:
+                return block
+
+        # every rare piece is requested already
+        for piece in choices:
+            block = piece.next_block()
+            if block:
                 return block
 
         return None
@@ -143,4 +190,3 @@ class Block:
         self.is_requested = False
         self.is_received = None
         self.request_time = None
-
