@@ -23,12 +23,15 @@ class PeerConnection:
 
         self.bitmap: bitarray = None
 
-    def connect(self, info_hash):
+    def connect(self, info_hash, conn_timeout = 2.0, handshake_timeout = 1.0):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # tcp
-        self.sock.settimeout(3)
+        self.sock.settimeout(conn_timeout)
         self.sock.connect((self.ip, self.port))
 
+        self.sock.settimeout(handshake_timeout)
         self._handshake(info_hash)
+
+        self.sock.settimeout(0.5)
 
     def _handshake(self, info_hash):
         pstr = b"BitTorrent protocol"
@@ -65,11 +68,11 @@ class PeerConnection:
         self.active = True
 
     def send_interested(self):
-        self.sock.sendall(struct.pack(">IB", 1, 2))
+        self._safe_send(struct.pack(">IB", 1, 2))
 
     def send_request(self, index, begin, length):
         msg = struct.pack(">IBIII", 13, 6, index, begin, length)
-        self.sock.sendall(msg)
+        self._safe_send(msg)
 
     def recv_message(self):
         try:
@@ -91,3 +94,16 @@ class PeerConnection:
                 raise ConnectionError("Socket closed")
             data += part
         return data
+
+    def _safe_send(self, payload: bytes) -> bool:
+        """
+        true on success, false otherwise
+        """
+        try:
+            self.sock.sendall(payload)
+            return True
+        except (BrokenPipeError,
+                ConnectionResetError,
+                OSError):  # covers [WinError 10054] etc.
+            self.active = False
+            return False

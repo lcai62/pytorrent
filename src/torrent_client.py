@@ -1,6 +1,7 @@
 # client.py
 import os
 import random
+import selectors
 import struct
 import time
 from typing import Optional, List
@@ -35,17 +36,21 @@ class TorrentClient:
         self.peers: List[PeerConnection] = []
         self.peer_manager = None
 
+        # select
+        self.select = selectors.DefaultSelector()
+
     def download(self):
 
         # ask tracker for peers, connect, and send interested
         self._bootstrap_peers()
+        print(self.peers)
         print("bootstrapping peers done")
         print("starting event loop")
 
         # TODO: what if no peers connect
 
         # event loop
-        self._pump_messages()
+        self._event_loop()
 
         # flush to buffer when done
         self._write_to_disk()
@@ -56,11 +61,14 @@ class TorrentClient:
         self.peer_manager = PeerManager(self.peers, self.torrent_file)
         self.peer_manager.connect_all()
 
+        self.peers = self.peer_manager.peers
         for peer in self.peers:
             if peer.active:
+                # add to selector
+                self.select.register(peer.sock, selectors.EVENT_READ, data=peer)
                 peer.send_interested()
 
-    def _pump_messages(self):
+    def _event_loop(self):
         """
         iterate over connected peers,
             reads one message (if any)
@@ -68,42 +76,59 @@ class TorrentClient:
             sends more request messages while peer unchoked
         """
         while not self.piece_manager.is_finished():
-            busy = False
+            self.piece_manager.tick()
 
-            for peer in self.peers:
+            # print("================================")
+            # print("peer statuses")
+            # for idx, peer in enumerate(self.peers):
+            #     print(f"peer {idx}, choked: {peer.choked}")
+            # print("================================")
+
+            events = self.select.select(timeout=1.0)
+            if not events:
+                continue
+
+            for key, _ in events:
+                peer: PeerConnection = key.data
                 if not peer.active:
                     continue
 
-                msg = peer.recv_message()
+                try:
+                    msg = peer.recv_message()
+                except ConnectionError:
+                    print(f"[{peer.ip}:{peer.port}] disconnected")
+                    peer.active = False
+                    self.select.unregister(peer.sock)
+                    peer.sock.close()
+                    continue
+
                 if msg is None:
                     continue
-                busy = True
 
                 if msg["type"] == "timeout":
-                    print("timeout received")
+                    print(f"timeout received")
                     continue
                 if msg["type"] == "keep-alive":
-                    print("keep alive received")
+                    print(f"keep alive received")
                     continue
 
                 # otherwise, type is message
                 message_id = msg["id"]
                 payload = msg["payload"]
 
-
                 # 0 = choke
                 if message_id == 0:
-                    print("choke received")
+                    print(f"choke received")
                     peer.choked = True
 
                 # 1 = unchoke
                 elif message_id == 1:
-                    print("unchoke received")
+                    print(f"unchoke received")
                     peer.choked = False
 
                 # 4 = have, update bitmap
                 elif message_id == 4:
-                    print("have received")
+                    print(f"have received")
                     piece_index = struct.unpack(">I", payload)[0]
                     self._ensure_bitmap(peer, self.num_pieces)
                     peer.bitmap[piece_index] = 1
@@ -111,9 +136,10 @@ class TorrentClient:
 
                 # 5 = bitfield
                 elif message_id == 5:
-                    print("bitfield received")
+                    print(f"bitfield received")
                     peer.bitmap = bitarray.bitarray()
                     peer.bitmap.frombytes(payload)
+                    self._ensure_bitmap(peer, self.num_pieces)
 
 
                 # 7 = piece
@@ -131,15 +157,13 @@ class TorrentClient:
                 if (not peer.choked) and peer.bitmap:
                     block = self.piece_manager.next_request(peer.bitmap)
                     if block:
+                        print(
+                            f"sending request for index: {block.piece_index}, offset: {block.offset}, length: {block.length}")
                         peer.send_request(
                             block.piece_index,
                             block.offset,
                             block.length
                         )
-
-                # sleep to avoid using all of cpu
-            # if not busy:
-            #     time.sleep(0.005)
 
     def _ensure_bitmap(self, peer: PeerConnection, num_pieces: int):
         if peer.bitmap is None:

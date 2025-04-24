@@ -2,11 +2,13 @@
 
 import hashlib
 import math
+import time
 from typing import Optional, List
 
 from src.torrent_file import TorrentFile
 
-BLOCK_SIZE = 2 ** 16
+BLOCK_SIZE = 1 << 14
+REQUEST_TIMEOUT = 30
 
 
 class PieceManager:
@@ -47,6 +49,17 @@ class PieceManager:
     def is_finished(self):
         return all(piece.is_complete for piece in self.pieces)
 
+    def tick(self):
+        now = time.time()
+        for piece in self.pieces:
+            if piece.is_complete:
+                continue
+            for block in piece.blocks:
+                if block.is_requested and not block.is_received:
+                    if now - block.request_time >= REQUEST_TIMEOUT:
+                        block.is_requested = False
+                        block.request_time = None
+
     def _calculate_pieces_lengths(self, total_length: int, piece_length: int) -> List[int]:
         full, remainder = divmod(total_length, piece_length)
         lengths = [piece_length] * full
@@ -76,7 +89,7 @@ class Piece:
     def next_block(self) -> Optional["Block"]:
         for block in self.blocks:
             if not block.is_requested and not block.is_received:
-                block.is_requested = True
+                block.set_requested()
                 return block
         return None
 
@@ -96,18 +109,18 @@ class Piece:
 
         blk.data = data
         blk.is_received = True
-        self.buffer[offset:offset + len(data)] = data
+        memoryview(self.buffer)[offset : offset + len(data)] = data # avoids two copies
 
         # if last block, verify hash
         if all(block.is_received for block in self.blocks):
-            if hashlib.sha1(self.buffer).digest() == self.sha1:
+            if hashlib.sha1(self.buffer, usedforsecurity=False).digest() == self.sha1:
                 self.is_complete = True
 
             else:
                 # bad hash, redownload
+                self.is_complete = False
                 for block in self.blocks:
-                    block.is_requested = block.is_received = False
-                    block.data = None
+                    block.reset()
                 self.buffer[:] = b'\x00' * self.length
 
 
@@ -119,3 +132,15 @@ class Block:
         self.data = None
         self.is_requested = False
         self.is_received = False
+        self.request_time = None
+
+    def set_requested(self):
+        self.is_requested = True
+        self.request_time = time.time()
+
+    def reset(self):
+        self.data = None
+        self.is_requested = False
+        self.is_received = None
+        self.request_time = None
+

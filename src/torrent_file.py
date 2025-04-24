@@ -35,5 +35,10 @@ class TorrentFile:
         self.length = self.info['length']
 
         bencoded_info = bencodepy.encode(self.info)
-        self.info_hash = hashlib.sha1(bencoded_info).digest()
+        self.info_hash = hashlib.sha1(bencoded_info, usedforsecurity=False).digest()
 
+
+        print(f"torrent name: {self.name}")
+        print(f"piece length: {self.piece_length}")
+        print(f"total pieces: {len(self.pieces) // 20}")
+        print(f"file size: {self.length}")

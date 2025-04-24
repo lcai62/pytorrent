@@ -20,7 +20,7 @@ class TrackerClient:
 
     def get_peers(self):
         info_bencoded = bencodepy.encode(self.torrent_file.info)
-        info_hash = hashlib.sha1(info_bencoded).digest()
+        info_hash = hashlib.sha1(info_bencoded, usedforsecurity=False).digest()
 
         url = self._build_url(info_hash)
 
@@ -48,7 +48,7 @@ class TrackerClient:
             'port': str(self.port),
             'uploaded': 0,
             'downloaded': 0,
-            'left': 0,
+            'left': self.torrent_file.length,
             'compact': 1,
         }
 

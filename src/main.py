@@ -25,15 +25,12 @@ from piece_manager import PieceManager
 #     conn.connect(info_hash)
 
 
-
 # main.py
 
 
-
 if __name__ == "__main__":
-    # small.torrent must sit next to this script (or run from that folder).
-    torrent_path = "small.torrent"
-    output_dir   = "."            # current directory
+    torrent_path = "large.torrent"
+    output_dir = "."
 
     client = TorrentClient(torrent_path, output_dir)
     client.download()

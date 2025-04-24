@@ -1,6 +1,7 @@
 import hashlib
 import socket
 import struct
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import bencodepy
 import requests
@@ -19,11 +20,23 @@ class PeerManager:
         self.torrent_file = torrent_file
 
     def connect_all(self):
-        for peer in self.peers:
+
+        def _connect(peer):
             try:
                 peer.connect(self.torrent_file.info_hash)
+                return peer
             except Exception as e:
                 print(f"connection failed {peer.ip}:{peer.port} — {e}")
+
+        alive = []
+        with ThreadPoolExecutor(max_workers=120) as pool:
+            futures = {pool.submit(_connect, peer) for peer in self.peers}
+            for future in as_completed(futures):
+                peer = future.result()
+                if peer is not None:
+                    alive.append(peer)
+
+        self.peers = alive
 
     def add_peer(self, peer: PeerConnection):
         self.peers.append(peer)
