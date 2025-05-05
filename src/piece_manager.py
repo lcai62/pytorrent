@@ -1,22 +1,49 @@
 # piece_manager.py
 
-import hashlib
-import math
 import random
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Optional, List
 
-from src.torrent_file import TorrentFile
+from bitarray import bitarray
+
+from peer_connection import PeerConnection
+from block import Block
+from piece import Piece
+from torrent_file import TorrentFile
+from storage import PieceStorage
 
 BLOCK_SIZE = 1 << 14
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 10
 
 
 class PieceManager:
-    def __init__(self, torrent_file: TorrentFile, block_size=BLOCK_SIZE):
+    """
+    manages pieces, blocks, and download state in a bittorrent session
+
+    Attributes:
+        torrent_file: instance of TorrentFile object
+        block_size: size of individual blocks
+        piece_storage: piece storage manager
+        pieces: list of Piece objects representing the torrent pieces
+        availability: counter tracking how many peers have each piece
+        inflight_by_peer: maps each PeerConnection to the blocks currently in-flight
+        downloaded_bytes: total number of bytes downloaded
+    """
+
+    def __init__(self, torrent_file: TorrentFile, piece_storage: PieceStorage, block_size: int = BLOCK_SIZE) -> None:
+        """
+        initializes a PieceManager
+
+        Args:
+            torrent_file: instance of TorrentFile object
+            block_size: size of individual blocks
+            piece_storage: piece storage manager
+        """
         self.torrent_file = torrent_file
         self.block_size = block_size
+
+        self.piece_storage = piece_storage
 
         self._hashes = [
             torrent_file.pieces[i:i + 20]
@@ -24,33 +51,59 @@ class PieceManager:
         ]
 
         self._lengths = self._calculate_pieces_lengths(
-            torrent_file.length, torrent_file.piece_length
+            torrent_file.total_length, torrent_file.piece_length
         )
 
         self.pieces: list[Piece] = [
-            Piece(i, self._hashes[i], self._lengths[i], block_size)
+            Piece(i, self._hashes[i], self._lengths[i], block_size, self.piece_storage,
+                  base_offset=i * torrent_file.piece_length)
             for i in range(len(self._hashes))
         ]
 
         self.availability = Counter()
 
-    def add_have(self, index):
+        self.inflight_by_peer: dict[PeerConnection, List[Block]] = defaultdict(list)
+
+        self.downloaded_bytes = 0
+
+    def add_have(self, index: int) -> None:
         """
-        gets called for every "have"
+        gets called for every "have", updates piece availability
         """
         self.availability[index] += 1
 
-    def add_bitmap(self, bitmap):
+    def add_bitmap(self, bitmap: bitarray) -> None:
         """
-        called for initial bitmap for each peer
+        called for initial bitmap for each peer, updates availability from full bitmap
         """
         for idx, have in enumerate(bitmap):
             if have:
                 self.availability[idx] += 1
 
-    def next_request(self, peer_bitmap) -> Optional["Block"]:
+    def peer_disconnect(self, bitmap: bitarray) -> None:
         """
-        returns next block that this peer can serve
+        called when peer disconnects, updates availability from last known bitmap
+        """
+        for idx, have in enumerate(bitmap):
+            if have:
+                self.availability[idx] = max(0, self.availability[idx] - 1)
+
+    def on_choke(self, peer: PeerConnection) -> None:
+        """
+        called when peer chokes this client, handles state reset
+        """
+        for block in self.inflight_by_peer.pop(peer, []):
+            block.reset()
+
+    def next_request(self, peer_bitmap: bitarray) -> Optional[Block]:
+        """
+        returns next block that can be requested from a peer
+
+        Args:
+            peer_bitmap: bitmap of corresponding peer
+
+        Returns:
+            Block instance ready to be requested, or None of no blocks are available
         """
         for piece in self.pieces:
             if piece.is_complete or not peer_bitmap[piece.index]:
@@ -61,7 +114,17 @@ class PieceManager:
 
         return None
 
-    def next_request_rarest_first(self, peer_bitmap) -> Optional["Block"]:
+    def next_request_rarest_first(self, peer_bitmap: bitarray) -> Optional[Block]:
+        """
+        returns next block that can be requested from a peer
+        follows the rarest piece first algorithm
+
+        Args:
+            peer_bitmap: bitmap of corresponding peer
+
+        Returns:
+            Block instance ready to be requested, or None of no blocks are available
+        """
         choices = [
             piece for piece in self.pieces
             if (not piece.is_complete) and peer_bitmap[piece.index]
@@ -69,8 +132,8 @@ class PieceManager:
         if not choices:
             return None
 
-        # find lowest avail
-        min_avail = min(self.availability.get(piece.index) for piece in choices)
+        # find the lowest avail
+        min_avail = min(self.availability.get(piece.index, 0) for piece in choices)
 
         rarest = [
             piece for piece in choices if self.availability.get(piece.index, 0) == min_avail
@@ -90,20 +153,44 @@ class PieceManager:
 
         return None
 
-    def block_received(self, piece_index, offset, data):
-        self.pieces[piece_index].block_received(offset, data)
+    def block_received(self, piece_index: int, offset: int, data: bytes) -> Optional[bool]:
+        """
+        called when a block is received, updates state
 
-    def is_finished(self):
+        Args:
+            piece_index: index of block containing the block
+            offset: offset of block in the piece
+            data: the block data
+
+        Returns:
+            True if the piece is completed and passed verification
+            False if block accepted, but piece not complete
+            None if block was invalid or already received
+        """
+        result = self.pieces[piece_index].block_received(offset, data)
+        if result in (True, False):
+            self.downloaded_bytes += len(data)
+
+        return result
+
+    def is_finished(self) -> bool:
+        """
+        checks if all pieces have been downloaded
+
+        Returns:
+            True if all pieces are downloaded, False otherwise.
+        """
         return all(piece.is_complete for piece in self.pieces)
 
-    def tick(self):
+    def tick(self) -> None:
+        """resets timed-out requests"""
         now = time.time()
         for piece in self.pieces:
             if piece.is_complete:
                 continue
             for block in piece.blocks:
                 if block.is_requested and not block.is_received:
-                    if now - block.request_time >= REQUEST_TIMEOUT:
+                    if block.request_time is not None and (now - block.request_time >= REQUEST_TIMEOUT):
                         block.is_requested = False
                         block.request_time = None
 
@@ -113,80 +200,3 @@ class PieceManager:
         if remainder:
             lengths.append(remainder)
         return lengths
-
-
-class Piece:
-    def __init__(self, index: int, sha1: bytes, length: int, block_size: int):
-        self.index = index
-        self.sha1 = sha1
-        self.length = length
-        self.block_size = block_size
-        self.is_complete = False
-
-        # slice piece into blocks
-        self.blocks: List[Block] = [
-
-            Block(index, offset, min(block_size, length - offset))
-            for offset in range(0, length, block_size)
-
-        ]
-
-        self.buffer = bytearray(length)
-
-    def next_block(self) -> Optional["Block"]:
-        for block in self.blocks:
-            if not block.is_requested and not block.is_received:
-                block.set_requested()
-                return block
-        return None
-
-    def block_received(self, offset: int, data: bytes):
-        # find matching block
-        blk = None
-        for block in self.blocks:
-            if block.offset == offset:
-                blk = block
-                break
-
-        if blk is None or len(data) != blk.length:
-            return
-
-        if blk.is_received:
-            return
-
-        blk.data = data
-        blk.is_received = True
-        memoryview(self.buffer)[offset : offset + len(data)] = data # avoids two copies
-
-        # if last block, verify hash
-        if all(block.is_received for block in self.blocks):
-            if hashlib.sha1(self.buffer, usedforsecurity=False).digest() == self.sha1:
-                self.is_complete = True
-
-            else:
-                # bad hash, redownload
-                self.is_complete = False
-                for block in self.blocks:
-                    block.reset()
-                self.buffer[:] = b'\x00' * self.length
-
-
-class Block:
-    def __init__(self, piece_index, offset, length):
-        self.piece_index = piece_index
-        self.offset = offset
-        self.length = length
-        self.data = None
-        self.is_requested = False
-        self.is_received = False
-        self.request_time = None
-
-    def set_requested(self):
-        self.is_requested = True
-        self.request_time = time.time()
-
-    def reset(self):
-        self.data = None
-        self.is_requested = False
-        self.is_received = None
-        self.request_time = None

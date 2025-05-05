@@ -1,109 +1,359 @@
-import struct
+from __future__ import annotations
 
+import struct
 import bitarray
 import socket
+
+from typing import Optional, Dict, Any
+
+PROTOCOL_STRING = b"BitTorrent protocol"
+HANDSHAKE_LEN = 49 + len(PROTOCOL_STRING)
+MAX_INFLIGHT = 10
 
 
 class PeerConnection:
     """
-    handles one tcp connection
+    manages tcp connection and message exchange with one bittorrent peer
+    handles sending / receiving protocol messages, handshakes, and connection states
+
+    Attributes:
+        peer_id: local peer's unique id
+        remote_id: connected peers unique id
+        ip: remote peer's ip
+        port: remote peer's port
+        sock: socket connection
+        active: True if connection is open and active
+        choked: True if remote peer has choked this client
+        remote_choked: True if this client has choked the remote peer
+        interested: True if this client is interested in peer's pieces
+        remote_interested: True if remote peer is interested in this client's pieces
+        bitmap: bitmap representing what pieces the peer has
     """
 
-    def __init__(self, ip: str, port: int, peer_id: str):
-        self.active: bool = False
+    def __init__(self, ip: str, port: int, peer_id: str) -> None:
+        """
+        initializes a PeerConnection
+
+        Args:
+            ip: ip address of remote peer
+            port: port number of remote peer
+            peer_id: local peer's unique id
+        """
+
+        # peer identification
+        self.peer_id: bytes = peer_id.encode() if isinstance(peer_id, str) else peer_id
+        self.remote_id = None
+
+        # networking
+        self.sock: Optional[socket.socket] = None
+
         self.ip: str = ip
         self.port: int = port
-        self.peer_id = peer_id
-        self.remote_id = None
-        self.sock = None
-        self.choked = True
-        self.remote_choked = True
-        self.interested = False
-        self.remote_interested = False
 
+        # states
+        self.active: bool = False
+
+        self.choked: bool = True
+        self.remote_choked: bool = True
+        self.interested: bool = False
+        self.remote_interested: bool = False
+
+        # availability
         self.bitmap: bitarray = None
 
-    def connect(self, info_hash, conn_timeout = 2.0, handshake_timeout = 1.0):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # tcp
-        self.sock.settimeout(conn_timeout)
+        # pipelining
+        self._inflight: int = 0
+
+        # incremental parsing
+        self._recv_buffer: bytearray = bytearray()
+        self._bytes_needed: Optional[int] = None
+
+    def connect(self, info_hash: bytes, handshake_timeout: float = 1.0) -> None:
+        """
+        establishes tcp connection and perform handshake
+
+        Args:
+            info_hash: SHA1 hash of the torrents info dictionary
+            handshake_timeout: timeout for handshake in seconds
+
+        Raises:
+            ConnectionError: if the handshake fails or socket closed
+        """
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # sock stream = tcp
+        self.sock.settimeout(handshake_timeout)
         self.sock.connect((self.ip, self.port))
 
-        self.sock.settimeout(handshake_timeout)
-        self._handshake(info_hash)
-
-        self.sock.settimeout(0.5)
-
-    def _handshake(self, info_hash):
-        pstr = b"BitTorrent protocol"
+        # send handshake
         reserved = b'\x00' * 8
         handshake = (
-                bytes([len(pstr)]) +
-                pstr +
+                bytes([len(PROTOCOL_STRING)]) +
+                PROTOCOL_STRING +
                 reserved +
                 info_hash +
-                self.peer_id.encode("utf-8")
+                self.peer_id
         )
         self.sock.sendall(handshake)
 
-        # receiving handshake
-        response = self.sock.recv(68)
+        # receiving handshake and validation
+        response = self._recv_exact(HANDSHAKE_LEN, handshake_timeout)
+        self._validate_handshake(response, info_hash)
 
-        if len(response) != 68:
-            raise Exception("incomplete handshake ")
-
-        # validate protocol string
-        if response[0] != len(pstr) or response[1:20] != pstr:
-            raise Exception("invalid protocol in handshake")
-
-        # validate info hash
-        received_info_hash = response[28:48]
-        if received_info_hash != info_hash:
-            raise Exception("info hash wrong — wrong torrent")
-
-        # get peer ID
-        self.remote_id = response[48:68]
-
-        print(f"connected to peer: {self.remote_id.decode(errors='ignore')}")
-
+        # completed, switch to non-blocking
+        self.sock.setblocking(False)
         self.active = True
 
-    def send_interested(self):
-        self._safe_send(struct.pack(">IB", 1, 2))
+    def close(self) -> None:
+        """closes peer connection and marks it invalid"""
 
-    def send_request(self, index, begin, length):
-        msg = struct.pack(">IBIII", 13, 6, index, begin, length)
-        self._safe_send(msg)
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception as e:
+                print(f"error closing socket: {self.ip}: {self.port} - {e}")
 
-    def recv_message(self):
+        self.active = False
+
+    def send_interested(self) -> bool:
+        """
+        send peer an 'interested' message
+
+        Returns:
+            True on success, False otherwise
+        """
+        return self._safe_send(struct.pack(">IB", 1, 2))
+
+    def send_choke(self) -> bool:
+        """
+        send peer a 'choke' message
+
+        Returns:
+            True on success, False otherwise
+        """
+        msg = struct.pack(">IB", 1, 0)
+        return self._safe_send(msg)
+
+    def send_unchoke(self) -> bool:
+        """
+        send peer an 'unchoke' message
+
+        Returns:
+            True on success, False otherwise
+        """
+        msg = struct.pack(">IB", 1, 1)
+        return self._safe_send(msg)
+
+    def send_have(self, index: int) -> bool:
+        """
+        send peer a 'have' message
+
+        Returns:
+            True on success, False otherwise
+        """
+        msg = struct.pack(">IBI", 5, 4, index)
+        return self._safe_send(msg)
+
+    def send_piece(self, index: int, start: int, data: bytes) -> bool:
+        """
+        send peer a 'piece' message containing file data
+
+        Args:
+            index: piece index
+            start: byte offset in the piece
+            data: block of data to send
+
+        Returns:
+            True on success, False otherwise
+        """
+        msg_length = 9 + len(data)
+        msg = struct.pack(">IBII", msg_length, 7, index, start) + data
+        return self._safe_send(msg)
+
+    def send_bitfield(self, bitfield: bytes) -> bool:
+        """
+        sends a 'bitfield' message representing our available pieces
+
+        Args:
+            bitfield: bitfield as bytes
+
+        Returns:
+            True if request was sent, False otherwise
+        """
+        msg_length = 1 + len(bitfield)
+        msg = struct.pack(">IB", msg_length, 5) + bitfield
+        return self._safe_send(msg)
+
+    def send_request(self, index: int, start: int, length: int) -> bool:
+        """
+        sends a request for a block of data if total inflight under max
+
+        Args:
+            index: the piece index
+            start: start byte offset in the piece
+            length: length of the requested block
+
+        Returns:
+            True if request was sent, False otherwise
+        """
+        if self._inflight >= MAX_INFLIGHT or not self.active:
+            return False
+
+        msg = struct.pack(">IBIII", 13, 6, index, start, length)
+        if self._safe_send(msg):
+            self._inflight += 1
+            return True
+
+        return False
+
+    def recv_message(self) -> Optional[Dict[str, Any]]:
+        """
+        non-blocking receive of the next message from this peer
+
+        Returns:
+            a dictionary with keys:
+                - 'type': either 'keep-alive' or 'message'
+                - 'id': message id (if type message)
+                - 'payload': message payload (if applicable)
+
+            returns none if no message is available
+
+        Raises:
+            ConnectionError: if remote peer closes the connection
+        """
+        if not self.active:
+            return None
+
         try:
-            length_bytes = self._recv_exact(4)
-            length = struct.unpack(">I", length_bytes)[0]
-            if length == 0:
-                return {'type': 'keep-alive'}
-            msg_id = self._recv_exact(1)[0]
-            payload = self._recv_exact(length - 1)
-            return {'type': 'message', 'id': msg_id, 'payload': payload}
-        except socket.timeout:
-            return {'type': 'timeout'}
+            received = self.sock.recv(4096)
+            if received:
+                self._recv_buffer.extend(received)
+            else:
+                raise ConnectionError("Socket closed by peer")
 
-    def _recv_exact(self, n):
-        data = b''
-        while len(data) < n:
-            part = self.sock.recv(n - len(data))
+        except BlockingIOError:
+            # no data
+            pass
+
+        message = self._parse_one()
+
+        # we have to update self._inflight here
+        if message and message.get("id") == 7:  # piece
+            self._inflight = max(0, self._inflight - 1)
+
+        elif message and message.get("id") == 0:  # choke
+            # all pending requests are void
+            self._inflight = 0
+
+        return message
+
+    def _parse_one(self) -> Optional[Dict[str, Any]]:
+        """
+        parses one message from the receive buffer (_recv_buffer)
+
+        Returns:
+            a dictionary with keys 'type', 'id', and 'payload', or None if message malformed
+        """
+
+        if self._bytes_needed is None:
+            if len(self._recv_buffer) < 4:
+                return None
+
+            length, = struct.unpack(">I", self._recv_buffer[:4])
+            del self._recv_buffer[:4]
+
+            if length == 0:
+                return {"type": "keep-alive"}
+
+            self._bytes_needed = length
+
+        if len(self._recv_buffer) < self._bytes_needed:
+            return None  # need to wait for more bytes
+
+        # received all
+        payload = self._recv_buffer[:self._bytes_needed]
+        del self._recv_buffer[:self._bytes_needed]
+        self._bytes_needed = None
+
+        msg_id = payload[0]
+        return {"type": "message", "id": msg_id, "payload": payload[1:]}
+
+    def _recv_exact(self, n: int, timeout: float) -> bytes:
+
+        """
+        receives exactly n bytes, blocks until complete or closed
+
+        Args:
+            n: number of bytes to receive
+            timeout: timeout in seconds
+
+        Returns:
+            received bytes
+
+        Raises:
+            ConnectionError: if peer closes the connection
+        """
+        self.sock.settimeout(timeout)
+        buffer = bytearray()
+
+        while len(buffer) < n:
+            part = self.sock.recv(n - len(buffer))
             if not part:
                 raise ConnectionError("Socket closed")
-            data += part
-        return data
+            buffer.extend(part)
+
+        return bytes(buffer)
 
     def _safe_send(self, payload: bytes) -> bool:
         """
-        true on success, false otherwise
+        sends payload to peer, deactivates peer on error
+
+        Args:
+            payload: raw bytes to send
+        Returns:
+            True if payload was sent successfully, False otherwise
         """
+        view = memoryview(payload)
         try:
-            self.sock.sendall(payload)
+            while view:
+                sent = self.sock.send(view)
+                view = view[sent:]
             return True
-        except (BrokenPipeError,
-                ConnectionResetError,
-                OSError):  # covers [WinError 10054] etc.
+
+        except (BlockingIOError, BrokenPipeError, ConnectionResetError, OSError):
             self.active = False
             return False
+
+    def _validate_handshake(self, response: bytes, info_hash: bytes) -> None:
+        """
+        validates the handshake response by checking info hash
+
+        Args:
+            response: the raw handshake response
+            info_hash: the expected info hash
+        Raises:
+            ConnectionError: if the handshake response is invalid or incorrect
+
+        """
+        if len(response) != HANDSHAKE_LEN:
+            raise ConnectionError("incomplete handshake")
+
+        pstr_len = response[0]
+        if pstr_len != len(PROTOCOL_STRING) or response[1:1 + pstr_len] != PROTOCOL_STRING:
+            raise ConnectionError("protocol string mismatch")
+
+        if response[1 + pstr_len + 8:1 + pstr_len + 8 + 20] != info_hash:
+            raise ConnectionError("info hash wrong - wrong torrent")
+
+        self.remote_id = response[-20:]  # last 20 bytes
+
+    def ensure_bitmap(self, num_pieces: int):
+        """
+        ensures this peers bitmap is initialized and sized correctly
+
+        Args:
+            num_pieces: the total number of pieces in the torrent
+        """
+        if self.bitmap is None:
+            self.bitmap = bitarray.bitarray(num_pieces)
+            self.bitmap.setall(0)
+        elif len(self.bitmap) < num_pieces:
+            self.bitmap.extend([0] * (num_pieces - len(self.bitmap)))

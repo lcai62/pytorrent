@@ -1,1 +1,7 @@
-bitarray
+bitarray~=3.3.1
+fastapi~=0.115.12
+uvicorn~=0.34.2
+python-multipart
+bencodepy~=0.9.5
+requests~=2.32.3
+pydantic~=2.11.3
