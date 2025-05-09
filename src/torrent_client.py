@@ -14,8 +14,13 @@ from peer_manager import PeerManager
 from piece_manager import PieceManager
 from storage import PieceStorage
 from torrent_file import TorrentFile
-from tracker_client import TrackerClient
-from udp_tracker_client import UDPTrackerClient
+from tracker_manager import TrackerManager
+
+
+def _generate_peer_id() -> str:
+    """generates a random peer id string"""
+    return "-PC0001-" + ''.join(random.choice("0123456789abcdef")
+                                for _ in range(12))
 
 
 class TorrentClient:
@@ -25,9 +30,8 @@ class TorrentClient:
     Attributes:
         torrent_file: TorrentFile instance
         peer_id: unique id for this torrent client
-        tracker: TrackerClient instance
+        tracker_manager: TrackerClient instance
         download_dir: directory where files should be stored
-        peers: list of PeerConnection objects
         peer_manager: PeerManager object
         select: i/o selector for non blocking peer communication
         piece_storage: PieceStorage object that handles all disk storage
@@ -54,11 +58,8 @@ class TorrentClient:
         self.torrent_file.parse()
 
         # trackers
-        self.peer_id: str = peer_id or self._generate_peer_id()
-        if self.torrent_file.announce.startswith("udp://"):
-            self.tracker = UDPTrackerClient(self.torrent_file, self.peer_id)
-        else:
-            self.tracker = TrackerClient(self.torrent_file, self.peer_id)
+        self.peer_id: str = peer_id or _generate_peer_id()
+        self.tracker_manager = TrackerManager(self.torrent_file, self.peer_id)
 
         self.download_dir: str = download_dir
 
@@ -88,6 +89,12 @@ class TorrentClient:
 
         self.start_time: float = time.time()
 
+        self._announce_worker_stop = threading.Event()
+
+        # bookkeeping
+        self.added_on: float | None = None
+        self.completed_on: float | None = None  # filled when piece manager is finished
+
     def download(self) -> None:
         """starts main download"""
 
@@ -96,25 +103,67 @@ class TorrentClient:
 
         # start retry worker
         self.peer_manager.start_retry_worker()
+        self.start_auto_announce_worker()
 
         self._event_loop()
 
     def pause(self) -> None:
         """pauses the download"""
+        for peer in self.peer_manager.peers:
+            peer.rates.clear()
+
         with self._paused_cond:
             self.paused = True
 
     def resume(self) -> None:
         """resumes the download"""
+        now = time.time()
+        for peer in self.peer_manager.peers:
+            peer.trim_samples(now)
+
         with self._paused_cond:
             self.paused = False
             self._paused_cond.notify_all()
+
+    def start_auto_announce_worker(self):
+        threading.Thread(target=self._auto_announce_loop, daemon=True).start()
+
+    def _auto_announce_loop(self):
+        while not self._announce_worker_stop.is_set():
+            now = time.time()
+            for tracker in self.tracker_manager.trackers:
+                if now >= tracker.next_announce:
+                    try:
+                        peers, interval = tracker.client.get_peers(event="")
+                        tracker.interval = interval
+                        tracker.next_announce = now + interval
+
+                        # Add new peers to PeerManager
+                        known_ips = {p.ip for p in self.peer_manager.peers}
+                        fresh_peers = [p for p in peers if p.ip not in known_ips]
+
+                        if fresh_peers:
+                            new_peer_manager = PeerManager(fresh_peers, self.torrent_file, self.piece_manager)
+                            new_peer_manager.connect_all()
+
+                            for peer in new_peer_manager.peers:
+                                if peer.active:
+                                    self.select.register(peer.sock, selectors.EVENT_READ, data=peer)
+                                    peer.send_interested()
+                                    self.peer_manager.add_peer(peer)
+
+                            print(f"[auto-announce] Added {len(fresh_peers)} new peers")
+
+                    except Exception as e:
+                        print(f"[auto-announce] Failed to reannounce on {tracker.client.tracker_url}: {e}")
+
+            time.sleep(5)  # check every 5 seconds (can adjust)
 
     def announce_now(self, event: str = "") -> None:
         """forces a re-announce to the tracker"""
 
         try:
-            new_peers = self.tracker.get_peers(event=event)
+            new_peers, _ = self.tracker_manager.get_all_peers(event=event)
             known_peer_ips = {peer.ip for peer in self.peer_manager.peers}
             fresh_peers = [p for p in new_peers if p.ip not in known_peer_ips]
 
@@ -137,7 +186,7 @@ class TorrentClient:
 
     def _setup_peers(self):
         """fetches peers from trackers, connects, add to selector and send initial messages"""
-        peers = self.tracker.get_peers(event="started")
+        peers, _ = self.tracker_manager.get_all_peers(event="started")
         self.peer_manager = PeerManager(peers, self.torrent_file, self.piece_manager)
         self.peer_manager.connect_all()
 
@@ -172,7 +221,7 @@ class TorrentClient:
 
                 try:
                     msg = peer.recv_message()
-                except ConnectionError:
+                except (ConnectionError, OSError) as e:
                     print(f"[{peer.ip}:{peer.port}] disconnected")
                     self.peer_manager.remove_peer(peer)
                     self.select.unregister(peer.sock)
@@ -223,11 +272,14 @@ class TorrentClient:
                         global_off = index * self.torrent_file.piece_length + start
                         block = self.piece_storage.read(global_off, length)
                         peer.send_piece(index, start, block)
+                        peer.record_upload(len(block))
 
                 elif message_id == 7:
+
                     index = struct.unpack(">I", payload[:4])[0]
                     begin = struct.unpack(">I", payload[4:8])[0]
                     block = payload[8:]
+                    peer.record_download(len(block))
 
                     completed = self.piece_manager.block_received(index, begin, block)
                     if completed:
@@ -237,6 +289,8 @@ class TorrentClient:
 
                         if self.piece_manager.is_finished():
                             self.piece_storage.switch_to_seeding()
+                            if self.completed_on is None:
+                                self.completed_on = time.time()
 
                 if (not peer.choked) and peer.bitmap:
                     block = self.piece_manager.next_request_rarest_first(peer.bitmap)
@@ -249,11 +303,6 @@ class TorrentClient:
         for piece in self.piece_manager.pieces:
             bits[piece.index] = piece.is_complete
         return bits.tobytes()
-
-    def _generate_peer_id(self) -> str:
-        """generates a random peer id string"""
-        return "-PC0001-" + ''.join(random.choice("0123456789abcdef")
-                                    for _ in range(12))
 
     def _verify_existing(self) -> None:
         """
@@ -289,6 +338,7 @@ class TorrentClient:
 
     def cleanup(self):
         """cleans up storage resources"""
+        self._announce_worker_stop.set()
         self.piece_storage.cleanup()
         self.peer_manager.close_all()
         self.peer_manager.stop_retry_worker()

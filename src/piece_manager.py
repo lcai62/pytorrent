@@ -7,14 +7,22 @@ from typing import Optional, List
 
 from bitarray import bitarray
 
-from peer_connection import PeerConnection
 from block import Block
+from peer_connection import PeerConnection
 from piece import Piece
-from torrent_file import TorrentFile
 from storage import PieceStorage
+from torrent_file import TorrentFile
 
 BLOCK_SIZE = 1 << 14
 REQUEST_TIMEOUT = 10
+
+
+def _calculate_pieces_lengths(total_length: int, piece_length: int) -> List[int]:
+    full, remainder = divmod(total_length, piece_length)
+    lengths = [piece_length] * full
+    if remainder:
+        lengths.append(remainder)
+    return lengths
 
 
 class PieceManager:
@@ -50,7 +58,7 @@ class PieceManager:
             for i in range(0, len(torrent_file.pieces), 20)
         ]
 
-        self._lengths = self._calculate_pieces_lengths(
+        self._lengths = _calculate_pieces_lengths(
             torrent_file.total_length, torrent_file.piece_length
         )
 
@@ -193,10 +201,3 @@ class PieceManager:
                     if block.request_time is not None and (now - block.request_time >= REQUEST_TIMEOUT):
                         block.is_requested = False
                         block.request_time = None
-
-    def _calculate_pieces_lengths(self, total_length: int, piece_length: int) -> List[int]:
-        full, remainder = divmod(total_length, piece_length)
-        lengths = [piece_length] * full
-        if remainder:
-            lengths.append(remainder)
-        return lengths

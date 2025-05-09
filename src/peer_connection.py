@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import struct
-import bitarray
 import socket
-
+import struct
+import time
 from typing import Optional, Dict, Any
+
+import bitarray
 
 PROTOCOL_STRING = b"BitTorrent protocol"
 HANDSHAKE_LEN = 49 + len(PROTOCOL_STRING)
-MAX_INFLIGHT = 10
+MAX_INFLIGHT = 40
 
 
 class PeerConnection:
@@ -67,6 +68,11 @@ class PeerConnection:
         # incremental parsing
         self._recv_buffer: bytearray = bytearray()
         self._bytes_needed: Optional[int] = None
+
+        # accounting
+        self.total_downloaded = 0
+        self.total_uploaded = 0
+        self._rates = []  # timestamp, down, up
 
     def connect(self, info_hash: bytes, handshake_timeout: float = 1.0) -> None:
         """
@@ -166,6 +172,7 @@ class PeerConnection:
         """
         msg_length = 9 + len(data)
         msg = struct.pack(">IBII", msg_length, 7, index, start) + data
+        self.record_upload(len(data))
         return self._safe_send(msg)
 
     def send_bitfield(self, bitfield: bytes) -> bool:
@@ -357,3 +364,59 @@ class PeerConnection:
             self.bitmap.setall(0)
         elif len(self.bitmap) < num_pieces:
             self.bitmap.extend([0] * (num_pieces - len(self.bitmap)))
+
+    def record_download(self, n: int):
+        """add downloaded bytes and speed sample"""
+        self.total_downloaded += n
+        now = time.time()
+        self._rates.append((now, n, 0))
+        self.trim_samples(now)
+
+    def record_upload(self, n: int):
+        """add uploaded bytes and speed sample"""
+        self.total_uploaded += n
+        now = time.time()
+        self._rates.append((now, 0, n))
+        self.trim_samples(now)
+
+    def trim_samples(self, now, window=10):
+        """keep at most 'window' seconds of samples"""
+        while self._rates and now - self._rates[0][0] > window:
+            self._rates.pop(0)
+
+    def down_speed_bps(self) -> float:
+        """average DL speed (bytes/s) over last 10s"""
+        if not self._rates:
+            return 0.0
+
+        now = time.time()
+        self.trim_samples(now)
+
+        if len(self._rates) < 2:
+            return 0.0
+
+        oldest_time = self._rates[0][0]
+        elapsed = now - oldest_time
+
+        if elapsed < 2.0:
+            return 0.0
+
+        bytes_dl = sum(s[1] for s in self._rates)
+        elapsed = max(1e-6, now - self._rates[0][0])
+        return bytes_dl / elapsed
+
+    def up_speed_bps(self) -> float:
+        """average UL speed (bytes/s) over last 10s"""
+        now = time.time()
+        self.trim_samples(now)
+
+        if not self._rates:
+            return 0.0
+
+        bytes_ul = sum(s[2] for s in self._rates)
+        elapsed = max(1e-6, now - self._rates[0][0])
+        return bytes_ul / elapsed
+
+    @property
+    def rates(self):
+        return self._rates

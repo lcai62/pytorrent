@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from datetime import datetime
-from typing import List, Any, Dict, cast
+from typing import List, Any, Dict, cast, Optional
 
 import bencodepy
 from fastapi import FastAPI
@@ -20,7 +20,6 @@ SESSION_FILE = "./session.json"
 app = FastAPI()
 torrents: List[TorrentClient] = []  # TorrentClient instances
 
-# Allow React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,6 +27,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def parse_peer_id(peer_id: str) -> str:
+    # azureus style
+    if len(peer_id) < 8 or peer_id[0] != '-':
+        return peer_id
+
+    code = peer_id[1:3]
+    version = peer_id[3:7]
+
+    client_map = {
+        "qB": "qBittorrent",
+        "UT": "uTorrent",
+        "TR": "Transmission",
+        "DE": "Deluge",
+        "LT": "libtorrent",
+        "AZ": "Azureus",
+        "BW": "BitComet",
+        "UW": "uTorrent Web",
+        "lt": "libTorrent",
+    }
+
+    name = client_map.get(code, "Unknown")
+    if name != "Unknown":
+        version_str = '.'.join(str(int(c, 36)) if c.isalpha() else c for c in version)
+        return f"{name} {version_str}"
+    return peer_id
 
 
 def save_session() -> None:
@@ -38,7 +64,9 @@ def save_session() -> None:
             "torrent_path": torrent.torrent_file.path,
             "download_dir": torrent.download_dir,
             "paused": getattr(torrent, "paused", False),
-            "is_finished": torrent.piece_manager.is_finished()
+            "is_finished": torrent.piece_manager.is_finished(),
+            "added_on": torrent.added_on,
+            "completed_on": torrent.completed_on
         })
     with open(SESSION_FILE, "w") as f:
         json.dump(data, f, indent=2)
@@ -64,6 +92,8 @@ def load_session() -> None:
                 was_finished=entry.get("is_finished", False)
             )
             client.start_time = time.time()
+            client.added_on = entry.get("added_on", time.time())
+            client.completed_on = entry.get("completed_on", None)
             torrents.append(client)
 
             if entry.get("paused", False):
@@ -82,7 +112,7 @@ def load_session() -> None:
 
 class ReannounceRequest(BaseModel):
     """reannounce endpoint model"""
-    id: int | None = None  # optional torrent index; if missing => all
+    id: Optional[int] = None  # optional torrent index; if missing => all
 
 
 @app.post("/reannounce")
@@ -124,6 +154,7 @@ async def upload_torrent(file: UploadFile = File(...), downloadPath: str = Form(
 
     client = TorrentClient(save_path, download_dir=downloadPath)
     client.start_time = time.time()  # Start tracking download time
+    client.added_on = time.time()
     threading.Thread(target=client.download, daemon=True).start()
 
     torrents.append(client)
@@ -173,8 +204,10 @@ async def parse_torrent(file: UploadFile = File(...)) -> dict[str, Any]:
     created_by = metadata.get(b'created by', b'').decode('utf-8',
                                                          errors='ignore') if b'created by' in metadata else None
     creation_date = metadata.get(b'creation date', None)
-    if creation_date:
-        creation_date = datetime.utcfromtimestamp(creation_date).isoformat() + 'Z'
+    if isinstance(creation_date, (int, float)):
+        creation_date = datetime.fromtimestamp(creation_date).strftime('%Y-%m-%d %H:%M:%S %Z')
+    else:
+        creation_date = None
 
     info_bencoded = bencodepy.encode(info)
     info_hash = hashlib.sha1(info_bencoded).hexdigest()
@@ -189,6 +222,12 @@ async def parse_torrent(file: UploadFile = File(...)) -> dict[str, Any]:
         "creation_date": creation_date,
         "info_hash": info_hash,
     }
+
+
+def get_progress(peer, num_pieces):
+    if not peer.bitmap:
+        return 0.0
+    return round(100 * peer.bitmap.count(1) / num_pieces, 2)
 
 
 @app.get("/status")
@@ -209,10 +248,11 @@ def get_status():
         done_size = torrent.piece_manager.downloaded_bytes
         percent_done = min((done_size / total_size) * 100 if total_size > 0 else 0, 100)
 
-        elapsed = max(1.0, (time.time() - torrent.start_time))
-        speed_mbps = (torrent.piece_manager.downloaded_bytes * 8) / (elapsed * 1_000_000)
+        if torrent.peer_manager and torrent.peer_manager.peers:
+            speed_mbps = sum(p.down_speed_bps() for p in torrent.peer_manager.peers if p.active) / 1_000_000
+        else:
+            speed_mbps = 0.0
 
-        # ETA calculation
         if speed_mbps > 0 and percent_done < 100:
             left_bytes = torrent.torrent_file.total_length * (1 - percent_done / 100)
             eta_seconds = (left_bytes * 8) / (speed_mbps * 1_000_000)
@@ -251,21 +291,83 @@ def get_status():
         else:
             status = "stalled"
 
+        if torrent.paused:
+            status = "paused"
+
+        min_next_announce = None
+        for tracker in torrent.tracker_manager.trackers:
+            if hasattr(tracker, 'next_announce'):
+                if min_next_announce is None or tracker.next_announce < min_next_announce:
+                    min_next_announce = tracker.next_announce
+
+        if min_next_announce:
+            reannounce_in = max(0, int(min_next_announce - time.time()))
+        else:
+            reannounce_in = None
+
+        general = {
+            "Total Size": f"{torrent.torrent_file.total_length / 1_000_000:.1f} MB",
+            "Pieces": f"{torrent.num_pieces} × {torrent.torrent_file.piece_length // 1024} KiB",
+            "Added On": datetime.fromtimestamp(torrent.added_on).strftime(
+                '%Y-%m-%d %H:%M:%S %Z') if torrent.added_on else None,
+            "Completed On": datetime.fromtimestamp(torrent.completed_on).strftime(
+                '%Y-%m-%d %H:%M:%S %Z') if torrent.completed_on else None,
+            "Created On": (
+                datetime.fromtimestamp(torrent.torrent_file.metadata.get('creation date')).strftime(
+                    '%Y-%m-%d %H:%M:%S %Z'))
+            if torrent.torrent_file.metadata.get("creation date") else None,
+            "Hash": torrent.torrent_file.info_hash.hex(),
+            "Saved at": torrent.download_dir,
+            "Comment": torrent.torrent_file.metadata.get(b'comment', b'')
+            .decode('utf-8', errors='ignore') if b'comment' in torrent.torrent_file.metadata else None
+        }
+
+        tracker_rows = [{
+            "url": tracker.client.tracker_url,
+            "tier": i,
+            "status": tracker.last_status,
+            "peers": tracker.last_peers,
+            "seeds": tracker.last_seeds,
+            "message": tracker.last_msg,
+            "nextAnnounce": int(tracker.next_announce - time.time())
+        } for i, tracker in enumerate(torrent.tracker_manager.trackers)]
+
+        peer_rows = []
+        if torrent.peer_manager:
+            for peer in torrent.peer_manager.peers:
+                peer_rows.append({
+                    "ip": peer.ip,
+                    "port": peer.port,
+                    "client": parse_peer_id(peer.remote_id.decode(errors='ignore') if peer.remote_id else ""),
+                    "progress": get_progress(peer, torrent.num_pieces),
+                    "flags": ("S" if peer.choked is False else "") + ("I" if peer.interested else ""),
+                    "downSpeed": round(peer.down_speed_bps() / 1024, 2),
+                    "upSpeed": round(peer.up_speed_bps() / 1024, 2),
+                    "downloaded": peer.total_downloaded,
+                    "uploaded": peer.total_uploaded
+                })
+
         torrent_infos.append({
             "id": idx,
             "name": torrent.torrent_file.name,
             "size": f"{torrent.torrent_file.total_length / 1_000_000:.1f} MB",
             "progress": round(percent_done, 2),
             "status": status,
-            "speed": f"{speed_mbps:.2f} Mbps",
+            "speed": "0 B/s" if torrent.paused else f"{speed_mbps:.2f} Mbps",
             "transmitting_peers": transmitting_peers,
             "transmitting_seeds": transmitting_seeds,
             "peers": len(peers),
             "seeds": len(seeds),
-            "eta": eta,
+            "eta": "∞" if torrent.paused else eta,
             "infoHash": torrent.torrent_file.info_hash.hex(),
             "downloadPath": torrent.download_dir,
-            "isMultiFile": is_multi
+            "isMultiFile": is_multi,
+            "reannounceIn": reannounce_in,
+            "details": {
+                "general": general,
+                "trackers": tracker_rows,
+                "peers": peer_rows
+            }
         })
 
     return {"torrents": torrent_infos}

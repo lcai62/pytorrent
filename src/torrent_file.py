@@ -47,6 +47,8 @@ class TorrentFile:
         self.files: Optional[List[dict]] = None
         self.is_multifile: bool = False
 
+        self.announce_list: Optional[List[List[str]]] = None
+
     def parse(self):
         """
         parses the .torrent file and populates class attributes
@@ -77,6 +79,9 @@ class TorrentFile:
                            "path": [self.name]
                            }]
             self.total_length = self.info["length"]
+
+        if 'announce-list' in self.metadata:
+            self.announce_list = self.metadata['announce-list']
 
     def file_layout(self) -> Generator[Tuple[List[str], int, int], None, None]:
         """

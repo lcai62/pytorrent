@@ -1,6 +1,6 @@
 import hashlib
 import struct
-from typing import List
+from typing import List, Tuple, cast, Dict, Any
 
 import bencodepy
 import requests
@@ -9,7 +9,12 @@ from peer_connection import PeerConnection
 from torrent_file import TorrentFile
 
 
-class TrackerClient:
+def percent_encode_bytes(b):
+    """percent encodes a byte string"""
+    return ''.join(f'%{byte:02X}' for byte in b)
+
+
+class HTTPTrackerClient:
     """
     handles communication with bittorrent tracker
 
@@ -19,7 +24,7 @@ class TrackerClient:
         port: the tcp port used by this client
     """
 
-    def __init__(self, torrent_file: TorrentFile, peer_id: str, port=6881):
+    def __init__(self, torrent_file: TorrentFile, peer_id: str, tracker_url, port=6881):
         """
         initializes TrackerClient
 
@@ -32,7 +37,9 @@ class TrackerClient:
         self.peer_id = peer_id
         self.port = port
 
-    def get_peers(self, event: str) -> List[PeerConnection]:
+        self.tracker_url = tracker_url
+
+    def get_peers(self, event: str) -> Tuple[List[PeerConnection], int]:
         """
         retrieve list of peers from tracker
 
@@ -55,7 +62,9 @@ class TrackerClient:
         if response.status_code != 200:
             raise Exception(f"tracker error: {response.status_code}")
 
-        data = bencodepy.decode(response.content)
+        data = cast(Dict[bytes, Any], bencodepy.decode(response.content))
+
+        interval = data.get(b'interval', 1800)
 
         peers_binary = data[b'peers']
 
@@ -65,7 +74,7 @@ class TrackerClient:
             port = struct.unpack(">H", peers_binary[i + 4:i + 6])[0]
             peers.append(PeerConnection(ip, port, self.peer_id))
 
-        return peers
+        return peers, interval
 
     def _build_url(self, info_hash: bytes, event):
         """
@@ -76,7 +85,7 @@ class TrackerClient:
             event: tracker event request type
         """
         params = {
-            'info_hash': self.percent_encode_bytes(info_hash),
+            'info_hash': percent_encode_bytes(info_hash),
             'peer_id': self.peer_id,
             'port': str(self.port),
             'uploaded': 0,
@@ -87,8 +96,4 @@ class TrackerClient:
         }
 
         query = '&'.join(f"{key}={value}" for key, value in params.items())
-        return f"{self.torrent_file.announce}?{query}"
-
-    def percent_encode_bytes(self, b):
-        """percent encodes a byte string"""
-        return ''.join(f'%{byte:02X}' for byte in b)
+        return f"{self.tracker_url}?{query}"
