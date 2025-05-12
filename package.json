@@ -1,0 +1,33 @@
+{
+  "name": "pytorrent",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.js",
+  "dependencies": {
+    "wait-on": "^8.0.3"
+  },
+  "scripts": {
+    "electron": "cross-env ELECTRON_DEV=true electron .",
+    "dev": "concurrently \"npm run start --prefix frontend\" \"npm run electron\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "forceCodeSigning": false,
+    "win": {
+      "target": "nsis"
+    },
+    "appId": "your.app.id",
+    "files": [
+      "src/dist/**",
+      "frontend/build/**",
+      "main.js",
+      "preload.js",
+      "package.json"
+    ]
+  }
+
+}
