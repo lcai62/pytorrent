@@ -5,11 +5,11 @@ downloading, seeding, tracker communication, P2P piece sharing, with a modern we
 
 ### Built With
 
-* [![Python][python-shield]][python-url]
-* [![FastAPI][fastapi-shield]][fastapi-url]
-* [![React][react-shield]][react-url]
-* [![TailwindCSS][tailwind-shield]][tailwind-url]
-* [![Electron][electron-shield]][electron-url]
+[![Python][python-shield]][python-url]  
+[![FastAPI][fastapi-shield]][fastapi-url]  
+[![React][react-shield]][react-url]  
+[![TailwindCSS][tailwind-shield]][tailwind-url]  
+[![Electron][electron-shield]][electron-url]
 
 ## Getting Started
 
