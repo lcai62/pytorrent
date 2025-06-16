@@ -43,7 +43,7 @@ downloading, seeding, tracker communication, P2P piece sharing, with a modern we
    ```
 4. Run the application
     ```sh
-   python main.py
+   python -m src.main
    npm run dev
     ```
 

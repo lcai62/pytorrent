@@ -2,10 +2,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
 
-from http_tracker_client import HTTPTrackerClient
-from peer_connection import PeerConnection
-from torrent_file import TorrentFile
-from udp_tracker_client import UDPTrackerClient
+from .http_tracker_client import HTTPTrackerClient
+from .peer_connection import PeerConnection
+from .torrent_file import TorrentFile
+from .udp_tracker_client import UDPTrackerClient
 
 
 class TrackerEntry:

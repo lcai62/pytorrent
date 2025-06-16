@@ -7,11 +7,11 @@ from typing import Optional, List
 
 from bitarray import bitarray
 
-from block import Block
-from peer_connection import PeerConnection
-from piece import Piece
-from storage import PieceStorage
-from torrent_file import TorrentFile
+from .block import Block
+from .peer_connection import PeerConnection
+from .piece import Piece
+from .storage_manager import PieceStorage
+from .torrent_file import TorrentFile
 
 BLOCK_SIZE = 1 << 14
 REQUEST_TIMEOUT = 10

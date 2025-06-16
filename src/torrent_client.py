@@ -9,12 +9,12 @@ from typing import Optional
 
 import bitarray
 
-from peer_connection import PeerConnection
-from peer_manager import PeerManager
-from piece_manager import PieceManager
-from storage import PieceStorage
-from torrent_file import TorrentFile
-from tracker_manager import TrackerManager
+from .peer_connection import PeerConnection
+from .peer_manager import PeerManager
+from .piece_manager import PieceManager
+from .storage_manager import PieceStorage
+from .torrent_file import TorrentFile
+from .tracker_manager import TrackerManager
 
 
 def _generate_peer_id() -> str:

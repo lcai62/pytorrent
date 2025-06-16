@@ -1,6 +1,11 @@
+import sys
+from pathlib import Path
+
 import uvicorn
 
-import fastapi_server
+from . import fastapi_server
+
+sys.path.append(str(Path(__file__).resolve().parent))
 
 if __name__ == "__main__":
     uvicorn.run(

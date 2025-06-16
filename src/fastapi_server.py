@@ -13,7 +13,7 @@ from fastapi import UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from torrent_client import TorrentClient
+from .torrent_client import TorrentClient
 
 SESSION_FILE = "./session.json"
 
@@ -249,7 +249,7 @@ def get_status():
         percent_done = min((done_size / total_size) * 100 if total_size > 0 else 0, 100)
 
         if torrent.peer_manager and torrent.peer_manager.peers:
-            speed_mbps = sum(p.down_speed_bps() for p in torrent.peer_manager.peers if p.active) / 1_000_000
+            speed_mbps = sum(p.down_speed_bps() for p in torrent.peer_manager.peers if p.active) * 8 / 1_000_000
         else:
             speed_mbps = 0.0
 

@@ -1,8 +1,8 @@
 import hashlib
 from typing import List, Optional
 
-from block import Block
-from storage import PieceStorage
+from .block import Block
+from .storage_manager import PieceStorage
 
 
 class Piece:

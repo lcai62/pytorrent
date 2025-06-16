@@ -4,8 +4,8 @@ import struct
 from typing import List, Tuple
 from urllib.parse import urlparse
 
-from peer_connection import PeerConnection
-from torrent_file import TorrentFile
+from .peer_connection import PeerConnection
+from .torrent_file import TorrentFile
 
 MAGIC_CONSTANT = 0x41727101980
 

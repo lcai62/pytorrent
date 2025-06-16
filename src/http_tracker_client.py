@@ -5,8 +5,8 @@ from typing import List, Tuple, cast, Dict, Any
 import bencodepy
 import requests
 
-from peer_connection import PeerConnection
-from torrent_file import TorrentFile
+from .peer_connection import PeerConnection
+from .torrent_file import TorrentFile
 
 
 def percent_encode_bytes(b):

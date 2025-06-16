@@ -3,7 +3,7 @@ from typing import List, Optional, Dict, Generator, Tuple
 
 import bencodepy
 
-from bencode import Bencode
+from .bencode import Bencode
 
 
 class TorrentFile:

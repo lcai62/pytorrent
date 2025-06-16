@@ -3,9 +3,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
-from peer_connection import PeerConnection
-from piece_manager import PieceManager
-from torrent_file import TorrentFile
+from .peer_connection import PeerConnection
+from .piece_manager import PieceManager
+from .torrent_file import TorrentFile
 
 
 class PeerManager:

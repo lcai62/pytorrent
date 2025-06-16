@@ -3,7 +3,7 @@ import os
 import pathlib
 import shutil
 
-from torrent_file import TorrentFile
+from .torrent_file import TorrentFile
 
 
 class PieceStorage:

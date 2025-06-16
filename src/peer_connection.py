@@ -352,7 +352,7 @@ class PeerConnection:
 
         self.remote_id = response[-20:]  # last 20 bytes
 
-    def ensure_bitmap(self, num_pieces: int):
+    def ensure_bitmap(self, num_pieces: int) -> None:
         """
         ensures this peers bitmap is initialized and sized correctly
 
